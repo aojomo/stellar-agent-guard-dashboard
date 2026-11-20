@@ -5,10 +5,14 @@ import { GuardContext, type GuardContextValue } from "../../components/GuardProv
 import { TxHistoryTable } from "../../components/TxHistoryTable.tsx";
 import {
   TX_HISTORY_LIMIT,
+  TX_HISTORY_MAX_AGE_DAYS,
+  TX_HISTORY_MAX_AGE_MS,
   TX_HISTORY_STORAGE_KEY,
+  clearTxHistory,
   filterTxHistory,
   loadTxHistory,
   paginateTxHistory,
+  pruneTxHistory,
   recordTx,
   subscribeTxHistory,
   txHistorySaveOutcome,
@@ -52,6 +56,15 @@ function fakeStorage(): StorageLike {
   };
 }
 
+/**
+ * A timestamp inside the retention window. A fixed calendar date here is a
+ * time bomb: once it is older than TX_HISTORY_MAX_AGE_DAYS, loadTxHistory
+ * prunes the fixture and every test that reads it back fails.
+ */
+function recentIso(minutesAgo = 60): string {
+  return new Date(Date.now() - minutesAgo * 60 * 1000).toISOString();
+}
+
 function entry(overrides: Partial<TxHistoryEntry> = {}): TxHistoryEntry {
   return {
     hash: `hash-${Math.random().toString(16).slice(2)}`,
@@ -60,7 +73,7 @@ function entry(overrides: Partial<TxHistoryEntry> = {}): TxHistoryEntry {
     feeStroops: "210",
     networkName: NETWORK.name,
     networkPassphrase: NETWORK.passphrase,
-    recordedAt: "2026-09-24T10:00:00.000Z",
+    recordedAt: recentIso(),
     ...overrides,
   };
 }
@@ -164,7 +177,7 @@ test("legacy history rows load with unknown network provenance", () => {
         operation: "freeze",
         status: "confirmed",
         feeStroops: null,
-        recordedAt: "2026-09-24T10:00:00.000Z",
+        recordedAt: recentIso(),
       },
     ]),
   );
@@ -325,9 +338,82 @@ test("an empty list paginates to a single empty page", () => {
   assert.deepEqual(page, { rows: [], page: 1, pages: 1, total: 0 });
 });
 
+test("an unconfirmed submission is recorded as unknown, distinct from failed", () => {
+  const storage = fakeStorage();
+  recordTx(
+    { hash: "ambiguous", operation: "set_policy", status: "unknown", feeStroops: "100" },
+    storage,
+  );
+
+  const rows = loadTxHistory(storage);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0]?.status, "unknown", "the third outcome survives the round trip");
+  // It is a stored status, so it passes entry validation instead of being
+  // dropped as corrupt — the row must stay visible to the operator.
+  assert.equal(rows[0]?.hash, "ambiguous");
+});
+
+test("search matches rows by their unconfirmed status", () => {
+  const entries = [
+    entry({ hash: "AMB123", status: "unknown" }),
+    entry({ hash: "OK456", status: "confirmed" }),
+  ];
+  assert.equal(filterTxHistory(entries, { query: "unknown" }).length, 1);
+  assert.equal(filterTxHistory(entries, { query: "AMB" }).length, 1);
+});
+
+test("CSV export carries the unconfirmed status verbatim", () => {
+  const csv = txHistoryToCsv([entry({ hash: "h-unknown", status: "unknown" })]);
+  const lines = csv.trimEnd().split("\n");
+  assert.match(lines[1] ?? "", /"unknown"/);
+});
+
+test("the table separates confirmed, failed and unconfirmed rows visually", async () => {
+  localStorage.setItem(
+    TX_HISTORY_STORAGE_KEY,
+    JSON.stringify([
+      entry({ hash: "row-unknown", status: "unknown" }),
+      entry({ hash: "row-confirmed", status: "confirmed" }),
+      entry({ hash: "row-failed", status: "failed" }),
+    ]),
+  );
+  const div = document.createElement("div");
+  document.body.appendChild(div);
+  root = createRoot(div);
+  await act(async () => {
+    root!.render(
+      React.createElement(
+        GuardContext.Provider,
+        { value: { server: {} } as unknown as GuardContextValue },
+        React.createElement(TxHistoryTable),
+      ),
+    );
+  });
+
+  const pillFor = (hash: string): Element | null => {
+    const row = [...div.querySelectorAll("tbody tr")].find((tr) => tr.textContent?.includes(hash));
+    return row?.querySelector(".pill") ?? null;
+  };
+  const unknownPill = pillFor("row-unknown");
+  assert.ok(unknownPill?.classList.contains("warn"), "an unconfirmed row wears the warning pill");
+  assert.equal(unknownPill?.textContent, "Unconfirmed");
+  assert.match(unknownPill?.getAttribute("title") ?? "", /verify this hash on chain/i);
+
+  assert.ok(pillFor("row-confirmed")?.classList.contains("ok"));
+  assert.ok(pillFor("row-failed")?.classList.contains("danger"));
+
+  // The panel states the no-replay rule where the operator will read it.
+  assert.ok(div.textContent?.includes("never resubmit blind"));
+});
+
 test("CSV export has a fixed header and one quoted row per entry", () => {
   const entries = [
-    entry({ hash: "h1", operation: "set_policy", feeStroops: "310" }),
+    entry({
+      hash: "h1",
+      operation: "set_policy",
+      feeStroops: "310",
+      recordedAt: "2026-09-24T10:00:00.000Z",
+    }),
     entry({
       hash: "h2",
       operation: 'odd "operation"',
@@ -345,11 +431,98 @@ test("CSV export has a fixed header and one quoted row per entry", () => {
   assert.equal(lines.length, 3);
   assert.equal(
     lines[1],
-    `"2026-09-24T10:00:00.000Z","set_policy","confirmed","h1","310","${NETWORK.name}","${NETWORK.passphrase}"`,
+    `"${entries[0]!.recordedAt}","set_policy","confirmed","h1","310","${NETWORK.name}","${NETWORK.passphrase}"`,
   );
   // Embedded quotes are doubled per RFC 4180, and a null fee exports empty.
   assert.equal(
     lines[2],
     `"2026-09-24T11:00:00.000Z","odd ""operation""","failed","h2","","${NETWORK.name}","${NETWORK.passphrase}"`,
   );
+});
+
+test("retention boundary: prunes records older than 30 days deterministically", () => {
+  const now = new Date("2026-10-20T12:00:00.000Z").getTime();
+  const thirtyDaysMs = 30 * 24 * 60 * 60 * 1000;
+
+  const entries: TxHistoryEntry[] = [
+    entry({ hash: "recent", recordedAt: new Date(now - 1000).toISOString() }),
+    entry({ hash: "boundary-ok", recordedAt: new Date(now - thirtyDaysMs + 5000).toISOString() }),
+    entry({
+      hash: "boundary-expired",
+      recordedAt: new Date(now - thirtyDaysMs - 5000).toISOString(),
+    }),
+    entry({ hash: "old", recordedAt: new Date(now - 40 * 24 * 60 * 60 * 1000).toISOString() }),
+  ];
+
+  const pruned = pruneTxHistory(entries, { now });
+  assert.equal(pruned.length, 2);
+  assert.equal(pruned[0]?.hash, "recent");
+  assert.equal(pruned[1]?.hash, "boundary-ok");
+});
+
+test("clearTxHistory clears local storage and memory and notifies subscribers", () => {
+  const storage = fakeStorage();
+  recordTx({ hash: "h1", operation: "freeze", status: "confirmed", feeStroops: null }, storage);
+  assert.equal(loadTxHistory(storage).length, 1);
+
+  let notified = 0;
+  const unsubscribe = subscribeTxHistory(() => {
+    notified += 1;
+  });
+
+  clearTxHistory(storage);
+  unsubscribe();
+
+  assert.equal(loadTxHistory(storage).length, 0);
+  assert.equal(notified, 1);
+});
+
+test("TxHistoryTable confirmation dialog warns that clearing local data does not change the chain", async () => {
+  localStorage.setItem(
+    TX_HISTORY_STORAGE_KEY,
+    JSON.stringify([entry({ hash: "tx-to-clear", status: "confirmed" })]),
+  );
+
+  const server = {
+    getTransaction: async () => ({ status: "SUCCESS" }),
+  };
+
+  const div = document.createElement("div");
+  document.body.appendChild(div);
+  root = createRoot(div);
+  await act(async () => {
+    root!.render(
+      React.createElement(
+        GuardContext.Provider,
+        { value: { server } as unknown as GuardContextValue },
+        React.createElement(TxHistoryTable),
+      ),
+    );
+  });
+
+  assert.ok(div.textContent?.includes("tx-to-clear"));
+
+  // Click clear button
+  const clearBtn = div.querySelector(
+    'button[data-testid="clear-history-button"]',
+  ) as HTMLButtonElement;
+  assert.ok(clearBtn);
+  await act(async () => clearBtn.click());
+
+  // Confirm dialog should appear stating that on-chain records are unchanged
+  assert.ok(div.textContent?.includes("Clear browser-local transaction history?"));
+  assert.ok(
+    div.textContent?.includes("On-chain transactions and ledger state are completely unchanged"),
+  );
+
+  // Click confirm
+  const confirmBtn = div.querySelector(
+    'button[data-testid="confirm-clear-history-button"]',
+  ) as HTMLButtonElement;
+  assert.ok(confirmBtn);
+  await act(async () => confirmBtn.click());
+
+  // History should now be empty in table and in storage
+  assert.equal(loadTxHistory().length, 0);
+  assert.ok(div.textContent?.includes("No transactions have been submitted from this console yet"));
 });
